@@ -52,12 +52,18 @@ internal class OmapiCleanupCoordinator<C>(
         private val readerKeys: () -> Set<String>,
         private val detachReader: (String) -> List<C>,
         private val clearAllLocalState: () -> Unit,
-        private val poisonStore: OmapiPoisonStore,
+        private val safetyStore: OmapiSafetyStore,
         private val bootIdentityProvider: OmapiBootIdentityProvider,
         private val nowEpochMillis: () -> Long = System::currentTimeMillis,
 ) {
     private val cleanupLock = ReentrantLock()
-    private val poison = AtomicReference<OmapiPoisonInfo?>(restorePersistedPoison())
+    private val poison = AtomicReference<OmapiPoisonInfo?>()
+    private var armed = false
+    private var armedBootIdentity: OmapiBootIdentity? = null
+
+    init {
+        poison.set(restorePersistedState())
+    }
 
     val poisonInfo: OmapiPoisonInfo?
         get() = poison.get()
@@ -73,6 +79,47 @@ internal class OmapiCleanupCoordinator<C>(
                 OmapiHardwareEntry.RESET,
                 OmapiHardwareEntry.DISCONNECT,
                 OmapiHardwareEntry.CLEANUP -> poison.get()
+            }
+
+    /** Must succeed before the caller touches SEService, Reader, Session, Channel, or APDU. */
+    fun enterHardware(entry: OmapiHardwareEntry): OmapiPoisonInfo? =
+            cleanupLock.withLock {
+                rejectionForHardwareEntry(entry)?.let { return@withLock it }
+                armLocked()
+            }
+
+    /** Clears the durable guard only after local cleanup and SEService shutdown both succeeded. */
+    fun confirmCleanShutdown(): OmapiPoisonInfo? =
+            cleanupLock.withLock {
+                poison.get()?.let { return@withLock it }
+                if (readerKeys().isNotEmpty()) {
+                    return@withLock markPoisonedLocked(
+                            readerName = null,
+                            reason = "Clean shutdown was requested while local OMAPI state remained",
+                            operationMayHaveSucceeded = true,
+                    )
+                }
+                if (!armed) return@withLock null
+
+                val cleared =
+                        try {
+                            safetyStore.clear()
+                        } catch (_: Exception) {
+                            false
+                        }
+                if (cleared) {
+                    armed = false
+                    armedBootIdentity = null
+                    return@withLock null
+                }
+
+                OmapiPoisonInfo(
+                                readerName = null,
+                                reason = "Unable to durably clear the OMAPI safety guard",
+                                operationMayHaveSucceeded = true,
+                                persistenceConfirmed = true,
+                        )
+                        .also { poison.set(it) }
             }
 
     fun cleanupReader(readerName: String): OmapiCleanupResult =
@@ -106,6 +153,12 @@ internal class OmapiCleanupCoordinator<C>(
     private fun cleanupReaderLocked(readerName: String): OmapiCleanupResult {
         // Detach first so re-entrant work can never rediscover this Session or its Channels.
         val channels = detachReader(readerName)
+        if (channels.isNotEmpty()) {
+            armLocked()?.let {
+                clearAllLocalState()
+                return OmapiCleanupResult.RebootRequired(it)
+            }
+        }
         for (channel in channels) {
             try {
                 backend.closeChannel(channel)
@@ -130,6 +183,9 @@ internal class OmapiCleanupCoordinator<C>(
     ): OmapiPoisonInfo {
         poison.get()?.let { return it }
 
+        // This is normally already armed. Keeping the check here makes direct error paths safe.
+        armLocked()?.let { return it }
+
         val candidate =
                 OmapiPoisonInfo(
                         readerName = readerName,
@@ -141,10 +197,11 @@ internal class OmapiCleanupCoordinator<C>(
         poison.set(candidate)
         val persisted =
                 try {
-                    poisonStore.save(
-                            PersistedOmapiPoison(
+                    safetyStore.savePoison(
+                            PersistedOmapiSafetyState(
+                                    kind = PersistedOmapiSafetyKind.POISONED,
                                     info = candidate,
-                                    bootIdentity = bootIdentityProvider.currentBootIdentity(),
+                                    bootIdentity = armedBootIdentity,
                                     recordedAtEpochMillis = nowEpochMillis(),
                             )
                     )
@@ -156,10 +213,51 @@ internal class OmapiCleanupCoordinator<C>(
         return finalInfo
     }
 
-    private fun restorePersistedPoison(): OmapiPoisonInfo? {
+    private fun armLocked(): OmapiPoisonInfo? {
+        poison.get()?.let { return it }
+        if (armed) return null
+
+        val identity =
+                try {
+                    bootIdentityProvider.currentBootIdentity()
+                } catch (_: Exception) {
+                    null
+                }
+        if (identity == null) {
+            return OmapiPoisonInfo(
+                            readerName = null,
+                            reason = "Unable to establish a reboot-scoped OMAPI safety guard",
+                            operationMayHaveSucceeded = false,
+                            persistenceConfirmed = false,
+                    )
+                    .also { poison.set(it) }
+        }
+
         val persisted =
                 try {
-                    poisonStore.load()
+                    safetyStore.saveArmed(identity, nowEpochMillis())
+                } catch (_: Exception) {
+                    false
+                }
+        if (!persisted) {
+            return OmapiPoisonInfo(
+                            readerName = null,
+                            reason = "Unable to durably arm the OMAPI safety guard",
+                            operationMayHaveSucceeded = false,
+                            persistenceConfirmed = false,
+                    )
+                    .also { poison.set(it) }
+        }
+
+        armedBootIdentity = identity
+        armed = true
+        return null
+    }
+
+    private fun restorePersistedState(): OmapiPoisonInfo? {
+        val persisted =
+                try {
+                    safetyStore.load()
                 } catch (e: Exception) {
                     return OmapiPoisonInfo(
                             readerName = null,
@@ -181,7 +279,7 @@ internal class OmapiCleanupCoordinator<C>(
         if (currentIdentity?.definitelyChangedSince(persisted.bootIdentity) == true) {
             val cleared =
                     try {
-                        poisonStore.clear()
+                        safetyStore.clear()
                     } catch (_: Exception) {
                         false
                     }
@@ -189,6 +287,17 @@ internal class OmapiCleanupCoordinator<C>(
         }
 
         // Missing, incomparable, unchanged, or contradictory identity signals all fail closed.
-        return persisted.info.copy(persistenceConfirmed = true)
+        return when (persisted.kind) {
+            PersistedOmapiSafetyKind.ARMED ->
+                    OmapiPoisonInfo(
+                            readerName = null,
+                            reason =
+                                    "OMAPI safety guard survived an unclean process exit on this boot",
+                            operationMayHaveSucceeded = true,
+                            persistenceConfirmed = true,
+                    )
+            PersistedOmapiSafetyKind.POISONED ->
+                    requireNotNull(persisted.info).copy(persistenceConfirmed = true)
+        }
     }
 }

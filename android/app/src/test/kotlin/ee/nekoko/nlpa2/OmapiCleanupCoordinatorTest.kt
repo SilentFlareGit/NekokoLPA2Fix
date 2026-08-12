@@ -11,21 +11,41 @@ import org.junit.Test
 
 class OmapiCleanupCoordinatorTest {
     private class FakePoisonStore(
-            @Volatile var persisted: PersistedOmapiPoison? = null,
-            var saveSucceeds: Boolean = true,
+            @Volatile var persisted: PersistedOmapiSafetyState? = null,
+            var armSucceeds: Boolean = true,
+            var poisonSaveSucceeds: Boolean = true,
             var clearSucceeds: Boolean = true,
-    ) : OmapiPoisonStore {
-        val saveCalls = AtomicInteger()
+    ) : OmapiSafetyStore {
+        val armCalls = AtomicInteger()
+        val poisonSaveCalls = AtomicInteger()
         val clearCalls = AtomicInteger()
 
         @Synchronized
-        override fun load(): PersistedOmapiPoison? = persisted
+        override fun load(): PersistedOmapiSafetyState? = persisted
 
         @Synchronized
-        override fun save(poison: PersistedOmapiPoison): Boolean {
-            saveCalls.incrementAndGet()
-            if (saveSucceeds) persisted = poison
-            return saveSucceeds
+        override fun saveArmed(
+                bootIdentity: OmapiBootIdentity,
+                recordedAtEpochMillis: Long,
+        ): Boolean {
+            armCalls.incrementAndGet()
+            if (armSucceeds) {
+                persisted =
+                        PersistedOmapiSafetyState(
+                                PersistedOmapiSafetyKind.ARMED,
+                                info = null,
+                                bootIdentity,
+                                recordedAtEpochMillis,
+                        )
+            }
+            return armSucceeds
+        }
+
+        @Synchronized
+        override fun savePoison(poison: PersistedOmapiSafetyState): Boolean {
+            poisonSaveCalls.incrementAndGet()
+            if (poisonSaveSucceeds) persisted = poison
+            return poisonSaveSucceeds
         }
 
         @Synchronized
@@ -71,7 +91,7 @@ class OmapiCleanupCoordinatorTest {
             val sessions: MutableSet<String> = mutableSetOf(),
             val channels: MutableMap<String, MutableList<String>> = mutableMapOf(),
             val successfulReaders: MutableSet<String> = mutableSetOf(),
-            val poisonStore: FakePoisonStore = FakePoisonStore(),
+            val safetyStore: FakePoisonStore = FakePoisonStore(),
             val bootIdentity: OmapiBootIdentity? = BOOT_ONE,
     ) {
         val coordinator =
@@ -88,7 +108,7 @@ class OmapiCleanupCoordinatorTest {
                             channels.clear()
                             successfulReaders.clear()
                         },
-                        poisonStore = poisonStore,
+                        safetyStore = safetyStore,
                         bootIdentityProvider = OmapiBootIdentityProvider { bootIdentity },
                         nowEpochMillis = { 1234L },
                 )
@@ -223,7 +243,7 @@ class OmapiCleanupCoordinatorTest {
                         readerKeys = { local.keys },
                         detachReader = { local.remove(it)?.toList() ?: emptyList() },
                         clearAllLocalState = { local.clear() },
-                        poisonStore = FakePoisonStore(),
+                        safetyStore = FakePoisonStore(),
                         bootIdentityProvider = OmapiBootIdentityProvider { BOOT_ONE },
                 )
         val executor = Executors.newFixedThreadPool(2)
@@ -244,7 +264,7 @@ class OmapiCleanupCoordinatorTest {
         val first = Fixture()
         first.coordinator.markPoisoned("SIM1", "INVALID_ARGUMENTS", false)
 
-        val recreated = Fixture(poisonStore = first.poisonStore, bootIdentity = BOOT_ONE)
+        val recreated = Fixture(safetyStore = first.safetyStore, bootIdentity = BOOT_ONE)
 
         assertTrue(recreated.coordinator.poisonInfo != null)
         assertEquals("INVALID_ARGUMENTS", recreated.coordinator.poisonInfo?.reason)
@@ -254,7 +274,7 @@ class OmapiCleanupCoordinatorTest {
     fun sameBootIdentityRemainsPoisonedAfterAppRestart() {
         val store = poisonedStore(BOOT_ONE)
 
-        val restarted = Fixture(poisonStore = store, bootIdentity = BOOT_ONE)
+        val restarted = Fixture(safetyStore = store, bootIdentity = BOOT_ONE)
 
         assertTrue(restarted.coordinator.poisonInfo != null)
         assertEquals(0, store.clearCalls.get())
@@ -264,7 +284,7 @@ class OmapiCleanupCoordinatorTest {
     fun verifiedDifferentBootIdentityClearsPersistedPoison() {
         val store = poisonedStore(BOOT_ONE)
 
-        val restarted = Fixture(poisonStore = store, bootIdentity = BOOT_TWO)
+        val restarted = Fixture(safetyStore = store, bootIdentity = BOOT_TWO)
 
         assertTrue(restarted.coordinator.poisonInfo == null)
         assertTrue(store.persisted == null)
@@ -275,7 +295,7 @@ class OmapiCleanupCoordinatorTest {
     fun unavailableBootIdentityFailsClosed() {
         val store = poisonedStore(BOOT_ONE)
 
-        val restarted = Fixture(poisonStore = store, bootIdentity = null)
+        val restarted = Fixture(safetyStore = store, bootIdentity = null)
 
         assertTrue(restarted.coordinator.poisonInfo != null)
         assertEquals(0, store.clearCalls.get())
@@ -285,7 +305,7 @@ class OmapiCleanupCoordinatorTest {
     fun failedDurableClearFailsClosedEvenAfterVerifiedReboot() {
         val store = poisonedStore(BOOT_ONE).apply { clearSucceeds = false }
 
-        val restarted = Fixture(poisonStore = store, bootIdentity = BOOT_TWO)
+        val restarted = Fixture(safetyStore = store, bootIdentity = BOOT_TWO)
 
         assertTrue(restarted.coordinator.poisonInfo != null)
         assertEquals(1, store.clearCalls.get())
@@ -294,7 +314,7 @@ class OmapiCleanupCoordinatorTest {
     @Test
     fun persistedPoisonRejectsEveryHardwareEntry() {
         val coordinator =
-                Fixture(poisonStore = poisonedStore(BOOT_ONE), bootIdentity = BOOT_ONE).coordinator
+                Fixture(safetyStore = poisonedStore(BOOT_ONE), bootIdentity = BOOT_ONE).coordinator
 
         for (entry in OmapiHardwareEntry.entries) {
             assertTrue("$entry must be rejected", coordinator.rejectionForHardwareEntry(entry) != null)
@@ -319,15 +339,15 @@ class OmapiCleanupCoordinatorTest {
     @Test
     fun onlyVerifiedDeviceRebootCanRestoreHealthyState() {
         val store = poisonedStore(BOOT_ONE)
-        assertTrue(Fixture(poisonStore = store, bootIdentity = null).coordinator.poisonInfo != null)
-        assertTrue(Fixture(poisonStore = store, bootIdentity = BOOT_ONE).coordinator.poisonInfo != null)
-        assertTrue(Fixture(poisonStore = store, bootIdentity = BOOT_TWO).coordinator.poisonInfo == null)
+        assertTrue(Fixture(safetyStore = store, bootIdentity = null).coordinator.poisonInfo != null)
+        assertTrue(Fixture(safetyStore = store, bootIdentity = BOOT_ONE).coordinator.poisonInfo != null)
+        assertTrue(Fixture(safetyStore = store, bootIdentity = BOOT_TWO).coordinator.poisonInfo == null)
     }
 
     @Test
     fun concurrentPoisoningPersistsOneConsistentFirstState() {
         val store = FakePoisonStore()
-        val fixture = Fixture(poisonStore = store)
+        val fixture = Fixture(safetyStore = store)
         val start = CountDownLatch(1)
         val executor = Executors.newFixedThreadPool(2)
         val calls =
@@ -345,7 +365,8 @@ class OmapiCleanupCoordinatorTest {
         start.countDown()
         val results = calls.map { it.get(2, TimeUnit.SECONDS) }
 
-        assertEquals(1, store.saveCalls.get())
+        assertEquals(1, store.armCalls.get())
+        assertEquals(1, store.poisonSaveCalls.get())
         assertEquals(results[0], results[1])
         assertEquals(results[0].reason, store.persisted?.info?.reason)
         executor.shutdownNow()
@@ -355,11 +376,19 @@ class OmapiCleanupCoordinatorTest {
     fun poisonIsPersistedBeforeRemainingLocalStateIsCleared() {
         val events = mutableListOf<String>()
         val store =
-                object : OmapiPoisonStore {
-                    override fun load(): PersistedOmapiPoison? = null
+                object : OmapiSafetyStore {
+                    override fun load(): PersistedOmapiSafetyState? = null
 
-                    override fun save(poison: PersistedOmapiPoison): Boolean {
-                        events += "persist"
+                    override fun saveArmed(
+                            bootIdentity: OmapiBootIdentity,
+                            recordedAtEpochMillis: Long,
+                    ): Boolean {
+                        events += "arm"
+                        return true
+                    }
+
+                    override fun savePoison(poison: PersistedOmapiSafetyState): Boolean {
+                        events += "persist-poison"
                         return true
                     }
 
@@ -385,18 +414,21 @@ class OmapiCleanupCoordinatorTest {
                             listOf("bad")
                         },
                         clearAllLocalState = { events += "clear-all" },
-                        poisonStore = store,
+                        safetyStore = store,
                         bootIdentityProvider = OmapiBootIdentityProvider { BOOT_ONE },
                 )
 
         coordinator.cleanupReader("SIM1")
 
-        assertEquals(listOf("detach-reader", "close", "persist", "clear-all"), events)
+        assertEquals(
+                listOf("detach-reader", "arm", "close", "persist-poison", "clear-all"),
+                events,
+        )
     }
 
     @Test
     fun persistenceFailureRemainsPoisonedAndIsReported() {
-        val fixture = Fixture(poisonStore = FakePoisonStore(saveSucceeds = false))
+        val fixture = Fixture(safetyStore = FakePoisonStore(poisonSaveSucceeds = false))
 
         val info = fixture.coordinator.markPoisoned("SIM1", "failure", false)
 
@@ -409,23 +441,107 @@ class OmapiCleanupCoordinatorTest {
         val store = poisonedStore(BOOT_ONE)
         val contradictory = OmapiBootIdentity(bootCount = 41L, kernelBootId = "boot-one")
 
-        val restarted = Fixture(poisonStore = store, bootIdentity = contradictory)
+        val restarted = Fixture(safetyStore = store, bootIdentity = contradictory)
 
         assertTrue(restarted.coordinator.poisonInfo != null)
         assertEquals(0, store.clearCalls.get())
     }
 
+    @Test
+    fun guardPersistenceFailurePreventsHardwareInvocation() {
+        val fixture = Fixture(safetyStore = FakePoisonStore(armSucceeds = false))
+        val hardwareCalls = AtomicInteger()
+
+        if (fixture.coordinator.enterHardware(OmapiHardwareEntry.OPEN_CHANNEL) == null) {
+            hardwareCalls.incrementAndGet()
+        }
+
+        assertEquals(0, hardwareCalls.get())
+        assertTrue(fixture.coordinator.poisonInfo != null)
+    }
+
+    @Test
+    fun armedMarkerRejectsProcessRecreationOnSameBoot() {
+        val first = Fixture()
+        assertTrue(first.coordinator.enterHardware(OmapiHardwareEntry.TRANSMIT) == null)
+
+        val recreated = Fixture(safetyStore = first.safetyStore, bootIdentity = BOOT_ONE)
+
+        assertTrue(recreated.coordinator.enterHardware(OmapiHardwareEntry.TRANSMIT) != null)
+    }
+
+    @Test
+    fun armedMarkerMayRecoverAfterVerifiedReboot() {
+        val first = Fixture()
+        assertTrue(first.coordinator.enterHardware(OmapiHardwareEntry.OPEN_SESSION) == null)
+
+        val restarted = Fixture(safetyStore = first.safetyStore, bootIdentity = BOOT_TWO)
+
+        assertTrue(restarted.coordinator.poisonInfo == null)
+        assertEquals(1, first.safetyStore.clearCalls.get())
+    }
+
+    @Test
+    fun cleanShutdownClearsGuardAndAllowsLaterNormalUse() {
+        val fixture = Fixture()
+        assertTrue(fixture.coordinator.enterHardware(OmapiHardwareEntry.CONNECT) == null)
+
+        assertTrue(fixture.coordinator.confirmCleanShutdown() == null)
+        assertTrue(fixture.safetyStore.persisted == null)
+        assertTrue(fixture.coordinator.enterHardware(OmapiHardwareEntry.CONNECT) == null)
+        assertEquals(2, fixture.safetyStore.armCalls.get())
+    }
+
+    @Test
+    fun cleanShutdownClearFailureFailsClosed() {
+        val store = FakePoisonStore(clearSucceeds = false)
+        val fixture = Fixture(safetyStore = store)
+        assertTrue(fixture.coordinator.enterHardware(OmapiHardwareEntry.CONNECT) == null)
+
+        val failure = fixture.coordinator.confirmCleanShutdown()
+
+        assertTrue(failure != null)
+        assertTrue(fixture.coordinator.enterHardware(OmapiHardwareEntry.CONNECT) != null)
+        assertEquals(PersistedOmapiSafetyKind.ARMED, store.persisted?.kind)
+    }
+
+    @Test
+    fun armedProcessCrashFailsClosedOnSameBoot() {
+        val store = FakePoisonStore()
+        Fixture(safetyStore = store).coordinator.enterHardware(OmapiHardwareEntry.INITIALIZE_SERVICE)
+
+        val afterCrash = Fixture(safetyStore = store, bootIdentity = BOOT_ONE)
+
+        assertTrue(afterCrash.coordinator.poisonInfo != null)
+        assertEquals(PersistedOmapiSafetyKind.ARMED, store.persisted?.kind)
+    }
+
+    @Test
+    fun failedPoisonWriteStillLeavesDurableArmedGuardForRecreatedProcess() {
+        val store = FakePoisonStore(poisonSaveSucceeds = false)
+        val first = Fixture(safetyStore = store)
+        assertTrue(first.coordinator.enterHardware(OmapiHardwareEntry.TRANSMIT) == null)
+
+        val info = first.coordinator.markPoisoned("SIM1", "INVALID_ARGUMENTS", true)
+        val recreated = Fixture(safetyStore = store, bootIdentity = BOOT_ONE)
+
+        assertFalse(info.persistenceConfirmed)
+        assertEquals(PersistedOmapiSafetyKind.ARMED, store.persisted?.kind)
+        assertTrue(recreated.coordinator.enterHardware(OmapiHardwareEntry.TRANSMIT) != null)
+    }
+
     private fun assertRecreationDoesNotClearPoison() {
         val store = poisonedStore(BOOT_ONE)
         repeat(2) {
-            assertTrue(Fixture(poisonStore = store, bootIdentity = BOOT_ONE).coordinator.poisonInfo != null)
+            assertTrue(Fixture(safetyStore = store, bootIdentity = BOOT_ONE).coordinator.poisonInfo != null)
         }
         assertEquals(0, store.clearCalls.get())
     }
 
     private fun poisonedStore(identity: OmapiBootIdentity?): FakePoisonStore =
             FakePoisonStore(
-                    PersistedOmapiPoison(
+                    PersistedOmapiSafetyState(
+                            kind = PersistedOmapiSafetyKind.POISONED,
                             info = OmapiPoisonInfo("SIM1", "persisted", true),
                             bootIdentity = identity,
                             recordedAtEpochMillis = 1000L,
