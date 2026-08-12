@@ -21,6 +21,8 @@ import io.flutter.plugin.common.MethodChannel.MethodCallHandler
 import io.flutter.plugin.common.MethodChannel.Result
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
 
 private fun ByteArray.toHex(): String =
         joinToString(separator = "") { eachByte -> "%02x".format(eachByte) }
@@ -54,8 +56,10 @@ class OmapiPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
             java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
 
     @Volatile private var profileSwitchInProgress = false
+    @Volatile private var acceptingHardwareOperations = false
 
     private lateinit var cleanupCoordinator: OmapiCleanupCoordinator<Channel>
+    private val hardwareLock = ReentrantLock()
 
     private fun createCleanupCoordinator(appContext: Context): OmapiCleanupCoordinator<Channel> =
             OmapiCleanupCoordinator(
@@ -92,7 +96,7 @@ class OmapiPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
                         readerChannels.clear()
                         readersWithSuccessfulChannel.clear()
                     },
-                    poisonStore = SharedPreferencesOmapiPoisonStore(appContext),
+                    safetyStore = SharedPreferencesOmapiSafetyStore(appContext),
                     bootIdentityProvider = AndroidOmapiBootIdentityProvider(appContext),
             )
 
@@ -110,17 +114,26 @@ class OmapiPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
                         Log.d(TAG, "SIM state changed: $state")
                         // Post to background handler to ensure it runs after any current operation
                         backgroundHandler?.post {
-                            Log.i(TAG, "SIM state change detected ($state), cleaning up stale sessions/channels")
-                            if (cleanupCoordinator.poisonInfo == null) {
-                                val cleanup = cleanupAllSessions()
-                                if (cleanup is OmapiCleanupResult.RebootRequired) {
-                                    Log.e(TAG, "SIM refresh cleanup poisoned OMAPI; reboot is required")
+                            if (!acceptingHardwareOperations) return@post
+                            hardwareLock.withLock {
+                                if (!acceptingHardwareOperations) return@withLock
+                                Log.i(
+                                        TAG,
+                                        "SIM state change detected ($state), cleaning up stale sessions/channels",
+                                )
+                                if (cleanupCoordinator.poisonInfo == null) {
+                                    val cleanup = cleanupAllSessions()
+                                    if (cleanup is OmapiCleanupResult.RebootRequired) {
+                                        Log.e(
+                                                TAG,
+                                                "SIM refresh cleanup poisoned OMAPI; reboot is required",
+                                        )
+                                    }
                                 }
+
+                                val eventMap = mapOf("type" to "sim_state_changed", "state" to state)
+                                runOnUiThread { sendEvent(eventMap) }
                             }
-                            
-                            // Send event to Flutter so it can refresh reader list/state if needed
-                            val eventMap = mapOf("type" to "sim_state_changed", "state" to state)
-                            runOnUiThread { sendEvent(eventMap) }
                         }
                     }
                 }
@@ -171,6 +184,7 @@ class OmapiPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
 
     override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
         Log.i(TAG, "onDetachedFromEngine")
+        acceptingHardwareOperations = false
         try {
             binding.applicationContext.unregisterReceiver(simStateReceiver)
         } catch (e: Exception) {
@@ -181,15 +195,7 @@ class OmapiPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
         eventChannel = null
         eventSink = null
 
-        if (::cleanupCoordinator.isInitialized) {
-            val cleanup = cleanupAllSessions()
-            if (cleanup is OmapiCleanupResult.Success) {
-                seService?.shutdown()
-                seService = null
-            } else {
-                Log.e(TAG, "Skipping SEService.shutdown() during engine detach because OMAPI is poisoned")
-            }
-        }
+        if (::cleanupCoordinator.isInitialized) shutdownServiceAfterCleanup("engine detach")
 
         stopBackgroundThread()
         context = null
@@ -213,37 +219,34 @@ class OmapiPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
         Log.i(TAG, "onAttachedToActivity")
         context = binding.activity.applicationContext
         startBackgroundThread()
-        initializeSEService()
+        acceptingHardwareOperations = true
+        hardwareLock.withLock { initializeSEService() }
     }
 
     override fun onDetachedFromActivityForConfigChanges() {}
 
     override fun onReattachedToActivityForConfigChanges(binding: ActivityPluginBinding) {
         context = binding.activity.applicationContext
+        acceptingHardwareOperations = true
     }
 
     override fun onDetachedFromActivity() {
         Log.i(TAG, "onDetachedFromActivity")
-        val cleanup = cleanupAllSessions()
-        if (cleanup is OmapiCleanupResult.Success) {
-            seService?.shutdown()
-            seService = null
-        } else {
-            Log.e(TAG, "Skipping SEService.shutdown() because OMAPI is poisoned")
-        }
+        acceptingHardwareOperations = false
+        shutdownServiceAfterCleanup("activity detach")
     }
 
     private fun initializeSEService(wait: Boolean = false): Boolean {
-        if (cleanupCoordinator.rejectionForHardwareEntry(OmapiHardwareEntry.INITIALIZE_SERVICE) != null) {
-            Log.e(TAG, "Refusing to initialize SEService while OMAPI is poisoned")
-            return false
-        }
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) {
             Log.w(TAG, "OMAPI requires Android 9.0 or higher")
             return false
         }
 
         val appContext = context ?: return false
+        if (cleanupCoordinator.enterHardware(OmapiHardwareEntry.INITIALIZE_SERVICE) != null) {
+            Log.e(TAG, "Refusing to initialize SEService without a durable OMAPI safety guard")
+            return false
+        }
 
         val latch = CountDownLatch(1)
         seService =
@@ -263,6 +266,34 @@ class OmapiPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
             }
         }
         return true
+    }
+
+    private fun shutdownServiceAfterCleanup(reason: String): Boolean = hardwareLock.withLock {
+        val cleanup = cleanupAllSessions()
+        if (cleanup is OmapiCleanupResult.RebootRequired) {
+            Log.e(TAG, "Skipping SEService.shutdown() during $reason because OMAPI is poisoned")
+            return@withLock false
+        }
+
+        try {
+            seService?.shutdown()
+            seService = null
+        } catch (e: Exception) {
+            cleanupCoordinator.markPoisoned(
+                    readerName = null,
+                    reason = "SEService.shutdown() failed during $reason: ${e.message ?: e.javaClass.simpleName}",
+                    operationMayHaveSucceeded = true,
+            )
+            Log.e(TAG, "SEService.shutdown() failed during $reason", e)
+            return@withLock false
+        }
+
+        val unsafe = cleanupCoordinator.confirmCleanShutdown()
+        if (unsafe != null) {
+            Log.e(TAG, "OMAPI safety guard could not be cleared during $reason")
+            return@withLock false
+        }
+        true
     }
 
     private fun sendEvent(event: Map<String, Any>) {
@@ -305,25 +336,37 @@ class OmapiPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
                         "closeChannels",
                         "transmitOnChannel",
                         "disconnect",
-                        "reset"
+                        "reset",
+                        "listReaders",
                 )
 
         if (backgroundMethods.contains(call.method)) {
             backgroundHandler?.post {
-                try {
-                    when (call.method) {
-                        "connect" -> handleConnect(call, result)
-                        "disconnect" -> handleDisconnect(call, result)
-                        "reset" -> handleReset(result)
-                        "transmit" -> handleTransmit(call, result)
-                        "openChannel" -> handleOpenChannel(call, result, false)
-                        "closeChannel" -> handleCloseChannel(call, result)
-                        "closeChannels" -> handleCloseChannels(call, result)
-                        "transmitOnChannel" -> handleTransmitOnChannel(call, result)
+                if (!acceptingHardwareOperations) {
+                    runOnUiThread { result.error("NOT_CONNECTED", "OMAPI lifecycle is detached", null) }
+                } else hardwareLock.withLock {
+                    if (!acceptingHardwareOperations) {
+                        runOnUiThread {
+                            result.error("NOT_CONNECTED", "OMAPI lifecycle is detached", null)
+                        }
+                        return@withLock
                     }
-                } catch (e: Exception) {
-                    Log.e(TAG, "Error in background method: ${call.method}", e)
-                    runOnUiThread { result.error("ERROR", e.message, null) }
+                    try {
+                        when (call.method) {
+                            "connect" -> handleConnect(call, result)
+                            "disconnect" -> handleDisconnect(call, result)
+                            "reset" -> handleReset(result)
+                            "transmit" -> handleTransmit(call, result)
+                            "openChannel" -> handleOpenChannel(call, result, false)
+                            "closeChannel" -> handleCloseChannel(call, result)
+                            "closeChannels" -> handleCloseChannels(call, result)
+                            "transmitOnChannel" -> handleTransmitOnChannel(call, result)
+                            "listReaders" -> handleListReaders(result)
+                        }
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Error in background method: ${call.method}", e)
+                        runOnUiThread { result.error("ERROR", e.message, null) }
+                    }
                 }
             }
                     ?: run {
@@ -331,8 +374,6 @@ class OmapiPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
                         Log.e(TAG, "Background handler not available for method: ${call.method}")
                         result.error("ERROR", "Background thread not available", null)
                     }
-        } else if (call.method == "listReaders") {
-            handleListReaders(result)
         } else {
             result.notImplemented()
         }
@@ -350,7 +391,7 @@ class OmapiPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
             result: Result,
             entry: OmapiHardwareEntry = OmapiHardwareEntry.OPEN_SESSION,
     ): Boolean {
-        val info = cleanupCoordinator.rejectionForHardwareEntry(entry) ?: return false
+        val info = cleanupCoordinator.enterHardware(entry) ?: return false
         runOnUiThread {
             result.error(
                     OMAPI_SESSION_CORRUPTED,
@@ -398,50 +439,38 @@ class OmapiPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
         val cachedNames = readerStatusCache.keys
 
         if (currentNames != cachedNames || currentTime - lastScanTime > 10000) {
-            // Run probing in background handler to avoid jank
-            backgroundHandler?.post {
-                try {
-                    // Reader discovery must not create a disposable Session: Session.close()
-                    // calls closeChannels() internally on affected Samsung firmware.
-                        val results =
-                                allReaders.map { reader ->
-                                    if (cleanupCoordinator.poisonInfo != null) {
-                                        throw IllegalStateException(OMAPI_SESSION_CORRUPTED)
-                                    }
-                                    if (!reader.isSecureElementPresent) {
-                                    reader.name to "No SIM card|Card not detected in slot"
-                                } else {
-                                    reader.name to null
-                                }
+            try {
+                // Reader discovery must not create a disposable Session: Session.close()
+                // calls closeChannels() internally on affected Samsung firmware.
+                val results =
+                        allReaders.map { reader ->
+                            if (cleanupCoordinator.poisonInfo != null) {
+                                throw IllegalStateException(OMAPI_SESSION_CORRUPTED)
                             }
-                    readerStatusCache.clear()
-                    for (res in results) {
-                        if (res.second != null) {
-                            readerStatusCache[res.first] = res.second!!
+                            if (!reader.isSecureElementPresent) {
+                                reader.name to "No SIM card|Card not detected in slot"
+                            } else {
+                                reader.name to null
+                            }
                         }
+                readerStatusCache.clear()
+                for (res in results) {
+                    if (res.second != null) {
+                        readerStatusCache[res.first] = res.second!!
                     }
-                    lastScanTime = currentTime
-
-                    // Return result on main thread
-                    val resultList = formatReaderList(allReaders)
-                    runOnUiThread { result.success(resultList) }
-                } catch (e: Exception) {
-                    if (cleanupCoordinator.poisonInfo != null) {
-                        rejectIfPoisoned(result)
-                        return@post
-                    }
-                    Log.e(TAG, "Background probing failed", e)
-                    // Fallback to minimal info
-                    runOnUiThread { result.success(allReaders.map { it.name }) }
                 }
+                lastScanTime = currentTime
+                runOnUiThread { result.success(formatReaderList(allReaders)) }
+            } catch (e: Exception) {
+                if (cleanupCoordinator.poisonInfo != null) {
+                    rejectIfPoisoned(result)
+                    return
+                }
+                Log.e(TAG, "Background probing failed", e)
+                runOnUiThread { result.success(allReaders.map { it.name }) }
             }
-                    ?: run {
-                        // If background handler is null, return cache or names immediately
-                        result.success(formatReaderList(allReaders))
-                    }
         } else {
-            // Use cache immediately
-            result.success(formatReaderList(allReaders))
+            runOnUiThread { result.success(formatReaderList(allReaders)) }
         }
     }
 
@@ -562,8 +591,22 @@ class OmapiPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
         Log.i(TAG, "Resetting SEService")
         val cleanup = cleanupAllSessions()
         if (reportCleanupFailure(result, cleanup)) return
-        seService?.shutdown()
-        seService = null
+        try {
+            seService?.shutdown()
+            seService = null
+        } catch (e: Exception) {
+            val info =
+                    cleanupCoordinator.markPoisoned(
+                            readerName = null,
+                            reason =
+                                    "SEService.shutdown() failed during reset: " +
+                                            (e.message ?: e.javaClass.simpleName),
+                            operationMayHaveSucceeded = true,
+                    )
+            return runOnUiThread {
+                result.error(OMAPI_SESSION_CORRUPTED, CORRUPTED_MESSAGE, poisonDetails(info))
+            }
+        }
         if (!initializeSEService(wait = true)) {
             return runOnUiThread {
                 result.error("NOT_CONNECTED", "SEService could not be initialized", null)
@@ -604,14 +647,32 @@ class OmapiPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
                                 result.error(
                                         "CHANNEL_FAILED",
                                         "Failed to open logical channel",
-                                        null
-                                )
+                                            null
+                                    )
                             }
+
+            // Track before transmit so every exceptional path remains individually cleanable.
+            readerChannels
+                    .getOrPut(readerName) { java.util.concurrent.ConcurrentHashMap() }[
+                            DEFAULT_EUICC_AID] = channel
 
             // Android OMAPI automatically handles CLA byte modification for logical channels.
             val response = channel.transmit(apduBytes)
+            val responseHex = response.toHex()
+            if (profileSwitchInProgress && responseHex.endsWith("6f00", ignoreCase = true)) {
+                val info =
+                        cleanupCoordinator.markPoisoned(
+                                readerName,
+                                "6F00 during profile switch",
+                                operationMayHaveSucceeded = true,
+                        )
+                return runOnUiThread {
+                    result.error(OMAPI_SESSION_CORRUPTED, CORRUPTED_MESSAGE, poisonDetails(info))
+                }
+            }
             try {
                 channel.close()
+                readerChannels[readerName]?.remove(DEFAULT_EUICC_AID, channel)
             } catch (closeError: Exception) {
                 val info =
                         cleanupCoordinator.markPoisoned(
@@ -627,10 +688,18 @@ class OmapiPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
                     )
                 }
             }
-            runOnUiThread { result.success(response.toHex()) }
+            runOnUiThread { result.success(responseHex) }
         } catch (e: Exception) {
             Log.e(TAG, "Transmit failed", e)
-            runOnUiThread { result.error("TRANSMIT_FAILED", e.message, null) }
+            val info =
+                    cleanupCoordinator.markPoisoned(
+                            readerName,
+                            e.message ?: e.javaClass.simpleName,
+                            operationMayHaveSucceeded = profileSwitchInProgress,
+                    )
+            runOnUiThread {
+                result.error(OMAPI_SESSION_CORRUPTED, CORRUPTED_MESSAGE, poisonDetails(info))
+            }
         }
     }
 
@@ -926,49 +995,19 @@ class OmapiPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
                     return
                 } catch (e: Exception) {
                     Log.e(TAG, "Channel transmit failed for AID $aidHex (attempt $attempt)", e)
-                    if (profileSwitchInProgress) {
-                        val info =
-                                cleanupCoordinator.markPoisoned(
-                                        readerName,
-                                        e.message ?: e.javaClass.simpleName,
-                                        operationMayHaveSucceeded = true,
-                                )
-                        return runOnUiThread {
-                            result.error(
-                                    OMAPI_SESSION_CORRUPTED,
-                                    CORRUPTED_MESSAGE,
-                                    poisonDetails(info),
+                    val info =
+                            cleanupCoordinator.markPoisoned(
+                                    readerName,
+                                    e.message ?: e.javaClass.simpleName,
+                                    operationMayHaveSucceeded = profileSwitchInProgress,
                             )
-                        }
+                    return runOnUiThread {
+                        result.error(
+                                OMAPI_SESSION_CORRUPTED,
+                                CORRUPTED_MESSAGE,
+                                poisonDetails(info),
+                        )
                     }
-                    if (attempt < maxAttempts) {
-                        readerChannels[readerName]?.remove(aidHex.uppercase())
-                        try {
-                            channel.close()
-                        } catch (closeError: Exception) {
-                            val info =
-                                    cleanupCoordinator.markPoisoned(
-                                            readerName,
-                                            closeError.message
-                                                    ?: closeError.javaClass.simpleName,
-                                            operationMayHaveSucceeded = false,
-                                    )
-                            return runOnUiThread {
-                                result.error(
-                                        OMAPI_SESSION_CORRUPTED,
-                                        CORRUPTED_MESSAGE,
-                                        poisonDetails(info),
-                                )
-                            }
-                        }
-
-                        Thread.sleep(currentDelay)
-                        currentDelay = (currentDelay * 1.5).toLong()
-                        attempt++
-                        continue
-                    }
-                    runOnUiThread { result.error("TRANSMIT_FAILED", e.message, null) }
-                    return
                 }
             } else if (attempt < maxAttempts) {
                 // We don't have a channel and re-open failed, but have retries left
