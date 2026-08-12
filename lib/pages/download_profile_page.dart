@@ -1756,7 +1756,16 @@ class _DownloadProfilePageState extends State<DownloadProfilePage> {
     });
     try {
       await widget.adapter.connect(widget.reader);
-      await widget.profileManager.enableProfile(_installedIccid!);
+      try {
+        await widget.adapter.setProfileSwitchInProgress(true);
+        await widget.profileManager.enableProfile(_installedIccid!);
+      } finally {
+        // The native setter remains available after poison so ordinary failures cannot
+        // leave the profile-switch classification window latched indefinitely.
+        try {
+          await widget.adapter.setProfileSwitchInProgress(false);
+        } catch (_) {}
+      }
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(AppLocalizations.of(context)!.profileEnabledSuccessfully)));
         Navigator.pop(context, true);

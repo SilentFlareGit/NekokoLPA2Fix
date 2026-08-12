@@ -55,7 +55,9 @@ class OmapiPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
 
     @Volatile private var profileSwitchInProgress = false
 
-    private val cleanupCoordinator =
+    private lateinit var cleanupCoordinator: OmapiCleanupCoordinator<Channel>
+
+    private fun createCleanupCoordinator(appContext: Context): OmapiCleanupCoordinator<Channel> =
             OmapiCleanupCoordinator(
                     backend =
                             object : OmapiCleanupBackend<Channel> {
@@ -90,6 +92,8 @@ class OmapiPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
                         readerChannels.clear()
                         readersWithSuccessfulChannel.clear()
                     },
+                    poisonStore = SharedPreferencesOmapiPoisonStore(appContext),
+                    bootIdentityProvider = AndroidOmapiBootIdentityProvider(appContext),
             )
 
     // Dedicated background thread for hardware operations
@@ -136,6 +140,14 @@ class OmapiPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
 
     override fun onAttachedToEngine(binding: FlutterPlugin.FlutterPluginBinding) {
         Log.i(TAG, "onAttachedToEngine")
+        // Restore reboot-required state before registering any callable hardware entry point.
+        val appContext = binding.applicationContext
+        context = appContext
+        cleanupCoordinator = createCleanupCoordinator(appContext)
+        cleanupCoordinator.poisonInfo?.let {
+            Log.e(TAG, "Persisted OMAPI poison restored; hardware access remains blocked until reboot")
+        }
+
         methodChannel = MethodChannel(binding.binaryMessenger, CHANNEL_NAME)
         methodChannel?.setMethodCallHandler(this)
 
@@ -169,7 +181,18 @@ class OmapiPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
         eventChannel = null
         eventSink = null
 
+        if (::cleanupCoordinator.isInitialized) {
+            val cleanup = cleanupAllSessions()
+            if (cleanup is OmapiCleanupResult.Success) {
+                seService?.shutdown()
+                seService = null
+            } else {
+                Log.e(TAG, "Skipping SEService.shutdown() during engine detach because OMAPI is poisoned")
+            }
+        }
+
         stopBackgroundThread()
+        context = null
     }
 
     private fun startBackgroundThread() {
@@ -208,11 +231,10 @@ class OmapiPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
         } else {
             Log.e(TAG, "Skipping SEService.shutdown() because OMAPI is poisoned")
         }
-        context = null
     }
 
     private fun initializeSEService(wait: Boolean = false): Boolean {
-        if (cleanupCoordinator.poisonInfo != null) {
+        if (cleanupCoordinator.rejectionForHardwareEntry(OmapiHardwareEntry.INITIALIZE_SERVICE) != null) {
             Log.e(TAG, "Refusing to initialize SEService while OMAPI is poisoned")
             return false
         }
@@ -260,7 +282,18 @@ class OmapiPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
             return
         }
 
-        if (rejectIfPoisoned(result)) return
+        val entry =
+                when (call.method) {
+                    "listReaders" -> OmapiHardwareEntry.LIST_READERS
+                    "connect" -> OmapiHardwareEntry.CONNECT
+                    "openChannel" -> OmapiHardwareEntry.OPEN_CHANNEL
+                    "transmit", "transmitOnChannel" -> OmapiHardwareEntry.TRANSMIT
+                    "reset" -> OmapiHardwareEntry.RESET
+                    "disconnect", "closeChannel", "closeChannels" ->
+                            OmapiHardwareEntry.DISCONNECT
+                    else -> OmapiHardwareEntry.OPEN_SESSION
+                }
+        if (rejectIfPoisoned(result, entry)) return
 
         // Methods that interact with hardware are moved to background threads
         val backgroundMethods =
@@ -313,8 +346,11 @@ class OmapiPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
                 ?: action()
     }
 
-    private fun rejectIfPoisoned(result: Result): Boolean {
-        val info = cleanupCoordinator.poisonInfo ?: return false
+    private fun rejectIfPoisoned(
+            result: Result,
+            entry: OmapiHardwareEntry = OmapiHardwareEntry.OPEN_SESSION,
+    ): Boolean {
+        val info = cleanupCoordinator.rejectionForHardwareEntry(entry) ?: return false
         runOnUiThread {
             result.error(
                     OMAPI_SESSION_CORRUPTED,
@@ -329,6 +365,7 @@ class OmapiPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
             mapOf(
                     "rebootRequired" to true,
                     "operationMayHaveSucceeded" to info.operationMayHaveSucceeded,
+                    "persistenceConfirmed" to info.persistenceConfirmed,
                     "reader" to info.readerName,
                     "reason" to info.reason,
             )
