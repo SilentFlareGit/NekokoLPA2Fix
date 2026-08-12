@@ -1,0 +1,54 @@
+name: Sync i18n
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * 1"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  crowdin:
+    runs-on: ubuntu-latest
+    env:
+      CROWDIN_PROJECT_ID: ${{ secrets.CROWDIN_PROJECT_ID }}
+      CROWDIN_PERSONAL_TOKEN: ${{ secrets.CROWDIN_PERSONAL_TOKEN }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Check Crowdin secrets
+        run: |
+          test -n "$CROWDIN_PROJECT_ID"
+          test -n "$CROWDIN_PERSONAL_TOKEN"
+
+      - name: Install Crowdin CLI
+        run: npm install -g @crowdin/cli
+
+      - name: Sync Crowdin translations
+        run: |
+          crowdin upload sources --no-progress
+          crowdin upload translations --no-progress
+          crowdin download --no-progress
+
+      - name: Regenerate localizations
+        run: |
+          flutter pub get
+          flutter gen-l10n
+
+      - name: Open translation pull request
+        uses: peter-evans/create-pull-request@v6
+        with:
+          branch: l10n/crowdin-sync
+          delete-branch: true
+          title: "chore(i18n): sync translations"
+          commit-message: "chore(i18n): sync translations"
+          body: "Automated weekly Crowdin sync for NekokoLPA2."

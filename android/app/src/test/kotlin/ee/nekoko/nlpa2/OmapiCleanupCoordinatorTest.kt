@@ -1,0 +1,203 @@
+package ee.nekoko.nlpa2
+
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+class OmapiCleanupCoordinatorTest {
+    private class FakeBackend : OmapiCleanupBackend<String> {
+        val closed = mutableListOf<String>()
+        var failOn: String? = null
+        var closeSessionChannelsCalls = 0
+        var closeSessionCalls = 0
+        var closeReaderSessionsCalls = 0
+        var reconnectCalls = 0
+
+        override fun closeChannel(channel: String) {
+            closed += channel
+            if (channel == failOn) throw IllegalArgumentException("INVALID_ARGUMENTS")
+        }
+
+        override fun closeSessionChannels(readerName: String) {
+            closeSessionChannelsCalls++
+        }
+
+        override fun closeSession(readerName: String) {
+            closeSessionCalls++
+        }
+
+        override fun closeReaderSessions(readerName: String) {
+            closeReaderSessionsCalls++
+        }
+
+        override fun reconnectService() {
+            reconnectCalls++
+        }
+    }
+
+    private class Fixture(
+            val backend: FakeBackend = FakeBackend(),
+            val sessions: MutableSet<String> = mutableSetOf(),
+            val channels: MutableMap<String, MutableList<String>> = mutableMapOf(),
+            val successfulReaders: MutableSet<String> = mutableSetOf(),
+    ) {
+        val coordinator =
+                OmapiCleanupCoordinator(
+                        backend = backend,
+                        readerKeys = { sessions + channels.keys + successfulReaders },
+                        detachReader = { reader ->
+                            sessions.remove(reader)
+                            successfulReaders.remove(reader)
+                            channels.remove(reader)?.toList() ?: emptyList()
+                        },
+                        clearAllLocalState = {
+                            sessions.clear()
+                            channels.clear()
+                            successfulReaders.clear()
+                        },
+                )
+    }
+
+    @Test
+    fun allChannelClosesSucceed() {
+        val fixture = Fixture(channels = mutableMapOf("SIM1" to mutableListOf("a", "b")))
+
+        assertEquals(OmapiCleanupResult.Success, fixture.coordinator.cleanupReader("SIM1"))
+        assertEquals(listOf("a", "b"), fixture.backend.closed)
+        assertFalse(fixture.coordinator.poisonInfo != null)
+    }
+
+    @Test
+    fun firstCloseFailurePoisonsAndNeverCallsBulkCleanupOrReconnect() {
+        val fixture = Fixture(channels = mutableMapOf("SIM1" to mutableListOf("a", "b")))
+        fixture.backend.failOn = "a"
+
+        assertTrue(fixture.coordinator.cleanupReader("SIM1") is OmapiCleanupResult.RebootRequired)
+        assertEquals(listOf("a"), fixture.backend.closed)
+        assertEquals(0, fixture.backend.closeSessionChannelsCalls)
+        assertEquals(0, fixture.backend.closeSessionCalls)
+        assertEquals(0, fixture.backend.closeReaderSessionsCalls)
+        assertEquals(0, fixture.backend.reconnectCalls)
+    }
+
+    @Test
+    fun secondCloseFailureStopsBeforeLaterChannels() {
+        val fixture = Fixture(channels = mutableMapOf("SIM1" to mutableListOf("a", "b", "c")))
+        fixture.backend.failOn = "b"
+
+        fixture.coordinator.cleanupReader("SIM1")
+
+        assertEquals(listOf("a", "b"), fixture.backend.closed)
+    }
+
+    @Test
+    fun firstReaderFailureStopsOtherReaders() {
+        val fixture =
+                Fixture(
+                        sessions = linkedSetOf("SIM1", "SIM2"),
+                        channels =
+                                linkedMapOf(
+                                        "SIM1" to mutableListOf("bad"),
+                                        "SIM2" to mutableListOf("other"),
+                                ),
+                )
+        fixture.backend.failOn = "bad"
+
+        fixture.coordinator.cleanupAll()
+
+        assertEquals(listOf("bad"), fixture.backend.closed)
+    }
+
+    @Test
+    fun poisonedStateRejectsLaterCleanupAndCannotReconnect() {
+        val fixture = Fixture(channels = mutableMapOf("SIM1" to mutableListOf("bad")))
+        fixture.backend.failOn = "bad"
+        fixture.coordinator.cleanupReader("SIM1")
+        fixture.channels["SIM1"] = mutableListOf("never")
+
+        assertTrue(fixture.coordinator.cleanupAll() is OmapiCleanupResult.RebootRequired)
+        assertEquals(listOf("bad"), fixture.backend.closed)
+        assertEquals(0, fixture.backend.reconnectCalls)
+    }
+
+    @Test
+    fun channelOnlyReaderIsIncludedByUnion() {
+        val fixture = Fixture(channels = mutableMapOf("SIM2" to mutableListOf("orphan")))
+
+        fixture.coordinator.cleanupAll()
+
+        assertEquals(listOf("orphan"), fixture.backend.closed)
+    }
+
+    @Test
+    fun profileSwitchFailureLatchesUncertainOutcomeWithoutRemoteCleanup() {
+        val fixture = Fixture(channels = mutableMapOf("SIM1" to mutableListOf("untouched")))
+
+        val info =
+                fixture.coordinator.markPoisoned(
+                        "SIM1",
+                        "6F00 during profile switch",
+                        operationMayHaveSucceeded = true,
+                )
+
+        assertTrue(info.operationMayHaveSucceeded)
+        assertTrue(fixture.channels.isEmpty())
+        assertTrue(fixture.backend.closed.isEmpty())
+    }
+
+    @Test
+    fun consecutiveCleanupCannotPassPoisonedState() {
+        val fixture = Fixture(channels = mutableMapOf("SIM1" to mutableListOf("bad")))
+        fixture.backend.failOn = "bad"
+
+        fixture.coordinator.cleanupReader("SIM1")
+        fixture.coordinator.cleanupReader("SIM1")
+
+        assertEquals(1, fixture.backend.closed.size)
+    }
+
+    @Test
+    fun concurrentCleanupRunsOnlyOneDangerousCloseAfterFailure() {
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val closeCalls = AtomicInteger()
+        val local = mutableMapOf("SIM1" to mutableListOf("bad"))
+        val backend =
+                object : OmapiCleanupBackend<String> {
+                    override fun closeChannel(channel: String) {
+                        closeCalls.incrementAndGet()
+                        entered.countDown()
+                        assertTrue(release.await(2, TimeUnit.SECONDS))
+                        throw IllegalStateException("INVALID_ARGUMENTS")
+                    }
+
+                    override fun closeSessionChannels(readerName: String) = Unit
+                    override fun closeSession(readerName: String) = Unit
+                    override fun closeReaderSessions(readerName: String) = Unit
+                    override fun reconnectService() = Unit
+                }
+        val coordinator =
+                OmapiCleanupCoordinator(
+                        backend,
+                        readerKeys = { local.keys },
+                        detachReader = { local.remove(it)?.toList() ?: emptyList() },
+                        clearAllLocalState = { local.clear() },
+                )
+        val executor = Executors.newFixedThreadPool(2)
+
+        val first = executor.submit<OmapiCleanupResult> { coordinator.cleanupReader("SIM1") }
+        assertTrue(entered.await(2, TimeUnit.SECONDS))
+        val second = executor.submit<OmapiCleanupResult> { coordinator.cleanupReader("SIM1") }
+        release.countDown()
+
+        assertTrue(first.get(2, TimeUnit.SECONDS) is OmapiCleanupResult.RebootRequired)
+        assertTrue(second.get(2, TimeUnit.SECONDS) is OmapiCleanupResult.RebootRequired)
+        assertEquals(1, closeCalls.get())
+        executor.shutdownNow()
+    }
+}

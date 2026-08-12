@@ -1,0 +1,8 @@
+REPLACE="
+"
+
+# Set permissions
+set_perm_recursive $MODPATH 0 0 0755 0644
+set_perm_recursive $MODPATH/system/priv-app/ee.nekoko.nlpa2 0 0 0755 0644
+chcon -R u:object_r:system_file:s0 $MODPATH/system/priv-app/ee.nekoko.nlpa2
+set_perm $MODPATH/system/etc/permissions/privapp-permissions-ee.nekoko.nlpa2.xml 0 0 0644

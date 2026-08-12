@@ -1,0 +1,9 @@
+name: 'PcscLib'
+output: '../lib/pcsc/generated/pcsc_lib.dart'
+headers:
+  entry-points:
+    - '../include.pcsc/winscard.h'
+functions:
+  symbol-address:
+    include:
+      - 'g_rgSCard.*Pci'

@@ -1,0 +1,87 @@
+{
+  "de": [
+    "aramSigningHistoryInstruction",
+    "beeSimFirmwareAction",
+    "beeSimFirmwareTitle",
+    "beeSimFirmwareWarning",
+    "beeSimFirmwareConfirm",
+    "omapiRebootRequiredTitle",
+    "omapiRebootRequiredMessage"
+  ],
+
+  "es": [
+    "aramSigningHistoryInstruction",
+    "beeSimFirmwareAction",
+    "beeSimFirmwareTitle",
+    "beeSimFirmwareWarning",
+    "beeSimFirmwareConfirm",
+    "omapiRebootRequiredTitle",
+    "omapiRebootRequiredMessage"
+  ],
+
+  "fr": [
+    "aramSigningHistoryInstruction",
+    "beeSimFirmwareAction",
+    "beeSimFirmwareTitle",
+    "beeSimFirmwareWarning",
+    "beeSimFirmwareConfirm",
+    "omapiRebootRequiredTitle",
+    "omapiRebootRequiredMessage"
+  ],
+
+  "it": [
+    "aramSigningHistoryInstruction",
+    "beeSimFirmwareAction",
+    "beeSimFirmwareTitle",
+    "beeSimFirmwareWarning",
+    "beeSimFirmwareConfirm",
+    "omapiRebootRequiredTitle",
+    "omapiRebootRequiredMessage"
+  ],
+
+  "ja": [
+    "aramSigningHistoryInstruction",
+    "beeSimFirmwareAction",
+    "beeSimFirmwareTitle",
+    "beeSimFirmwareWarning",
+    "beeSimFirmwareConfirm",
+    "omapiRebootRequiredTitle",
+    "omapiRebootRequiredMessage"
+  ],
+
+  "ko": [
+    "aramSigningHistoryInstruction",
+    "beeSimFirmwareAction",
+    "beeSimFirmwareTitle",
+    "beeSimFirmwareWarning",
+    "beeSimFirmwareConfirm",
+    "omapiRebootRequiredTitle",
+    "omapiRebootRequiredMessage"
+  ],
+
+  "ru": [
+    "aramSigningHistoryInstruction",
+    "beeSimFirmwareAction",
+    "beeSimFirmwareTitle",
+    "beeSimFirmwareWarning",
+    "beeSimFirmwareConfirm",
+    "omapiRebootRequiredTitle",
+    "omapiRebootRequiredMessage"
+  ],
+
+  "zh": [
+    "aramSigningHistoryInstruction",
+    "beeSimFirmwareAction",
+    "beeSimFirmwareTitle",
+    "beeSimFirmwareWarning",
+    "beeSimFirmwareConfirm"
+  ],
+
+  "zh_TW": [
+    "aramSigningHistoryInstruction",
+    "beeSimFirmwareAction",
+    "beeSimFirmwareTitle",
+    "beeSimFirmwareWarning",
+    "beeSimFirmwareConfirm"
+  ]
+}

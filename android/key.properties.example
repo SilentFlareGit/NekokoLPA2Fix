@@ -1,0 +1,7 @@
+# Copy this file to android/key.properties only if you want to override
+# the bundled community signing key or provide private flavor signing.
+
+community.storeFile=community.jks
+community.storePassword=CommunityKey
+community.keyAlias=communitykey
+community.keyPassword=CommunityKey
